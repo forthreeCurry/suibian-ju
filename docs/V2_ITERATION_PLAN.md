@@ -20,7 +20,8 @@
 |------|------|------|
 | **数据源** | 18 家虚拟餐厅 | 数据不真实、无法体现实时性、缺乏说服力 |
 | **推荐算法** | 规则引擎（if-else+ 加权） | 推荐维度单一、缺乏个性化深度 |
-| **覆盖范围** | 仅望京 SOHO 商圈 | 无法扩展到其他城市/商圈 |
+| **覆盖范围** | 仅望京 SOHO 商圈（固定） | 无法扩展到其他城市/商圈，用户体验割裂 |
+| **位置获取** | MVP 阶段固定望京 SOHO | 无法根据用户实际位置推荐，实用性低 |
 | **用户信任** | 无第三方背书 | 推荐理由缺乏可信度 |
 
 ### 1.2 V2.0 核心目标
@@ -32,8 +33,9 @@
 │                                                         │
 │  ✅ 真实数据：接入高德 + 美团官方 API，覆盖 1000+ 餐厅     │
 │  ✅ 智能推荐：多 Agent 协作，推荐准确率提升至 85%+        │
+│  ✅ 实时定位：GPS+ 基站+WIFI 三重定位，全国任意位置可用   │
 │  ✅ 实时性：营业状态、排队情况、价格变动实时更新         │
-│  ✅ 个性化：用户授权采集小红书/抖音笔记，千人千面推荐   │
+│  ✅ 个性化：用户授权采集小红书笔记/截图，千人千面推荐   │
 │  ✅ 可扩展：支持北京/上海/广州/深圳等一线城市           │
 │                                                         │
 └─────────────────────────────────────────────────────────┘
@@ -280,6 +282,439 @@ export async function syncRestaurantsForArea(
 // 定时任务（使用 Vercel Cron Jobs）
 // 全量更新：每天 03:00
 // 增量更新：每小时整点
+```
+
+---
+
+### 3.1.4 位置获取模块（新增）
+
+#### 3.1.4.1 技术选型
+
+```typescript
+/**
+ * V2.0 位置获取方案：三重定位 + 智能降级
+ * 
+ * 优先级：
+ * 1. GPS 定位（精度：5-10 米）- 户外最佳
+ * 2. 基站定位（精度：100-1000 米）- 室内/地下室
+ * 3. WiFi 定位（精度：20-50 米）- 城市环境
+ * 4. IP 定位（精度：1-5 公里）- 兜底方案
+ */
+```
+
+#### 3.1.4.2 前端定位实现
+
+```typescript
+// src/lib/location-service.ts
+
+interface LocationResult {
+  latitude: number;
+  longitude: number;
+  accuracy: number;       // 精度（米）
+  address?: string;       // 逆地理编码地址
+  timestamp: number;
+  source: 'gps' | 'network' | 'wifi' | 'ip';
+}
+
+interface LocationOptions {
+  enableHighAccuracy?: boolean;  // 是否启用高精度
+  timeout?: number;              // 超时时间（毫秒）
+  maximumAge?: number;           // 缓存时间（毫秒）
+}
+
+/**
+ * 浏览器 Geolocation API 定位
+ * 支持 GPS + 网络定位
+ */
+export async function getCurrentPosition(
+  options: LocationOptions = {}
+): Promise<LocationResult> {
+  return new Promise((resolve, reject) => {
+    if (!navigator.geolocation) {
+      reject(new Error("浏览器不支持定位"));
+      return;
+    }
+
+    const defaultOptions: LocationOptions = {
+      enableHighAccuracy: true,  // 启用高精度
+      timeout: 10000,            // 10 秒超时
+      maximumAge: 300000         // 5 分钟缓存
+    };
+
+    const mergedOptions = { ...defaultOptions, ...options };
+
+    navigator.geolocation.getCurrentPosition(
+      (position) => {
+        const { latitude, longitude, accuracy } = position.coords;
+        
+        resolve({
+          latitude,
+          longitude,
+          accuracy: accuracy || 100,
+          timestamp: position.timestamp,
+          source: accuracy && accuracy < 50 ? 'gps' : 'network'
+        });
+      },
+      (error) => {
+        console.error("定位失败:", error);
+        
+        // 降级到 IP 定位
+        if (error.code === error.POSITION_UNAVAILABLE) {
+          getIPLocation().then(resolve).catch(reject);
+        } else {
+          reject(error);
+        }
+      },
+      mergedOptions
+    );
+  });
+}
+
+/**
+ * IP 定位（兜底方案）
+ * 使用高德 IP 定位 API
+ */
+export async function getIPLocation(): Promise<LocationResult> {
+  const response = await fetch(
+    `https://restapi.amap.com/v3/ip?key=${process.env.NEXT_PUBLIC_GAODE_API_KEY}`
+  );
+  
+  const data = await response.json();
+  
+  if (data.status !== '1') {
+    throw new Error("IP 定位失败");
+  }
+
+  // 解析返回的矩形区域，取中心点
+  const rectangle = data.rectangle.split(',').map(Number);
+  const centerLat = (rectangle[1] + rectangle[3]) / 2;
+  const centerLng = (rectangle[0] + rectangle[2]) / 2;
+
+  return {
+    latitude: centerLat,
+    longitude: centerLng,
+    accuracy: 5000,  // IP 定位精度约 5km
+    address: data.city,
+    timestamp: Date.now(),
+    source: 'ip'
+  };
+}
+
+/**
+ * 逆地理编码：坐标 → 地址
+ */
+export async function reverseGeocode(
+  latitude: number,
+  longitude: number
+): Promise<string> {
+  const response = await fetch(
+    `https://restapi.amap.com/v3/geocode/regeo?` +
+    `key=${process.env.NEXT_PUBLIC_GAODE_API_KEY}&` +
+    `location=${longitude},${latitude}`
+  );
+  
+  const data = await response.json();
+  
+  if (data.status === '1' && data.regeocode) {
+    return data.regeocode.formatted_address;
+  }
+  
+  throw new Error("地址解析失败");
+}
+
+/**
+ * 智能定位：组合多种定位方式
+ * 策略：先尝试高精度定位，失败则降级
+ */
+export async function smartLocate(): Promise<LocationResult> {
+  try {
+    // 1. 尝试高精度定位（GPS）
+    console.log("尝试 GPS 定位...");
+    const gpsLocation = await getCurrentPosition({
+      enableHighAccuracy: true,
+      timeout: 8000
+    });
+    
+    if (gpsLocation.accuracy < 50) {
+      console.log("GPS 定位成功，精度:", gpsLocation.accuracy);
+      return gpsLocation;
+    }
+    
+    // 2. GPS 精度不足，尝试网络定位
+    console.log("GPS 精度不足，尝试网络定位...");
+    const networkLocation = await getCurrentPosition({
+      enableHighAccuracy: false,
+      timeout: 5000
+    });
+    
+    if (networkLocation.accuracy < 500) {
+      console.log("网络定位成功，精度:", networkLocation.accuracy);
+      return networkLocation;
+    }
+    
+    // 3. 降级到 IP 定位
+    console.log("网络定位精度不足，使用 IP 定位...");
+    return await getIPLocation();
+    
+  } catch (error) {
+    // 所有定位都失败，使用 IP 定位兜底
+    console.error("定位失败，使用 IP 定位兜底:", error);
+    return await getIPLocation();
+  }
+}
+
+/**
+ * 监听位置变化（持续定位）
+ */
+export function watchLocation(
+  callback: (location: LocationResult) => void,
+  options?: LocationOptions
+): number {
+  const watchId = navigator.geolocation.watchPosition(
+    (position) => {
+      const { latitude, longitude, accuracy } = position.coords;
+      
+      callback({
+        latitude,
+        longitude,
+        accuracy: accuracy || 100,
+        timestamp: position.timestamp,
+        source: accuracy && accuracy < 50 ? 'gps' : 'network'
+      });
+    },
+    (error) => {
+      console.error("位置监听失败:", error);
+    },
+    {
+      enableHighAccuracy: true,
+      timeout: 10000,
+      maximumAge: 60000,  // 1 分钟缓存
+      ...options
+    }
+  );
+  
+  return watchId;
+}
+
+// 停止监听
+export function clearLocationWatch(watchId: number) {
+  navigator.geolocation.clearWatch(watchId);
+}
+```
+
+#### 3.1.4.3 前端定位组件
+
+```typescript
+// src/components/LocationSelector.tsx
+"use client";
+
+import { useState, useEffect, useCallback } from "react";
+import { motion, AnimatePresence } from "framer-motion";
+import { smartLocate, reverseGeocode, watchLocation, clearLocationWatch } from "@/src/lib/location-service";
+
+interface LocationSelectorProps {
+  onLocationChange?: (location: {
+    lat: number;
+    lng: number;
+    address: string;
+  }) => void;
+}
+
+export default function LocationSelector({ onLocationChange }: LocationSelectorProps) {
+  const [locating, setLocating] = useState(false);
+  const [location, setLocation] = useState<{
+    lat: number;
+    lng: number;
+    address: string;
+    accuracy: number;
+    source: string;
+  } | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  // 定位
+  const handleLocate = useCallback(async () => {
+    setLocating(true);
+    setError(null);
+
+    try {
+      const result = await smartLocate();
+      const address = await reverseGeocode(result.latitude, result.longitude);
+
+      const locationData = {
+        lat: result.latitude,
+        lng: result.longitude,
+        address,
+        accuracy: result.accuracy,
+        source: result.source
+      };
+
+      setLocation(locationData);
+      onLocationChange?.(locationData);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "定位失败，请重试");
+    } finally {
+      setLocating(false);
+    }
+  }, [onLocationChange]);
+
+  // 组件挂载时自动定位
+  useEffect(() => {
+    handleLocate();
+
+    // 可选：持续监听位置变化（适用于移动场景）
+    // const watchId = watchLocation((result) => {
+    //   reverseGeocode(result.latitude, result.longitude).then(address => {
+    //     setLocation({
+    //       lat: result.latitude,
+    //       lng: result.longitude,
+    //       address,
+    //       accuracy: result.accuracy,
+    //       source: result.source
+    //     });
+    //   });
+    // });
+
+    // return () => clearLocationWatch(watchId);
+  }, []);
+
+  return (
+    <div className="w-full max-w-sm space-y-3 rounded-2xl bg-white/90 p-5 shadow-lg">
+      {/* 定位按钮 */}
+      <button
+        onClick={handleLocate}
+        disabled={locating}
+        className="flex w-full items-center justify-center gap-2 rounded-xl bg-gradient-to-r from-blue-500 to-cyan-500 py-3 font-semibold text-white disabled:opacity-50"
+      >
+        {locating ? (
+          <>
+            <span className="h-4 w-4 animate-spin rounded-full border-2 border-white border-t-transparent" />
+            定位中...
+          </>
+        ) : (
+          <>
+            <span>📍</span>
+            获取当前位置
+          </>
+        )}
+      </button>
+
+      {/* 定位结果 */}
+      <AnimatePresence>
+        {location && (
+          <motion.div
+            initial={{ opacity: 0, height: 0 }}
+            animate={{ opacity: 1, height: "auto" }}
+            exit={{ opacity: 0, height: 0 }}
+            className="space-y-2 overflow-hidden"
+          >
+            <div className="rounded-xl bg-green-50 p-3">
+              <div className="flex items-start gap-2">
+                <span className="text-xl">✅</span>
+                <div className="flex-1">
+                  <p className="text-sm font-semibold text-green-800">
+                    定位成功
+                  </p>
+                  <p className="mt-1 text-xs text-green-700">
+                    📍 {location.address}
+                  </p>
+                  <div className="mt-2 flex items-center gap-3 text-xs text-green-600">
+                    <span>精度：±{Math.round(location.accuracy)}m</span>
+                    <span>•</span>
+                    <span>
+                      来源：{
+                        location.source === 'gps' ? 'GPS' :
+                        location.source === 'network' ? '网络' :
+                        location.source === 'wifi' ? 'WiFi' : 'IP'
+                      }
+                    </span>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            {/* 手动修改地址（可选） */}
+            <button
+              onClick={() => {
+                // 打开地图选择器
+              }}
+              className="w-full cursor-pointer rounded-xl border border-gray-200 py-2 text-sm text-gray-600 hover:bg-gray-50"
+            >
+              ️ 在地图上手动调整（可选）
+            </button>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* 错误提示 */}
+      {error && (
+        <div className="rounded-xl bg-red-50 p-3 text-sm text-red-600">
+          ⚠️ {error}
+          <button
+            onClick={handleLocate}
+            className="ml-2 font-semibold underline"
+          >
+            重试
+          </button>
+        </div>
+      )}
+
+      {/* 定位说明 */}
+      <div className="mt-2 rounded-xl bg-blue-50 p-3">
+        <p className="text-xs text-blue-700">
+          💡 定位权限仅用于推荐附近餐厅，不会记录或分享您的位置信息
+        </p>
+      </div>
+    </div>
+  );
+}
+```
+
+#### 3.1.4.4 数据库扩展
+
+```sql
+-- 新增用户位置历史表（可选，用于优化推荐）
+create table user_location_history (
+  id uuid primary key default gen_random_uuid(),
+  user_id text,  -- 匿名用户可用设备 ID
+  latitude numeric(10, 8) not null,
+  longitude numeric(11, 8) not null,
+  address text,
+  accuracy numeric,
+  location_source text check (location_source in ('gps', 'network', 'wifi', 'ip')),
+  created_at timestamptz default now()
+);
+
+-- 创建索引
+create index idx_user_location_history_user on user_location_history(user_id);
+create index idx_user_location_history_time on user_location_history(created_at desc);
+
+-- 创建函数：获取用户常用位置
+create or replace function get_user_frequent_locations(
+  p_user_id text,
+  p_limit int default 5
+)
+returns table (
+  latitude numeric,
+  longitude numeric,
+  address text,
+  visit_count bigint
+)
+language plpgsql
+as $$
+begin
+  return query
+  select
+    latitude,
+    longitude,
+    max(address) as address,
+    count(*) as visit_count
+  from user_location_history
+  where user_id = p_user_id
+  group by latitude, longitude
+  order by visit_count desc
+  limit p_limit;
+end;
+$$;
 ```
 
 ---
@@ -1165,7 +1600,7 @@ class ExplanationGenerator:
         return self.chain.invoke(params)
 ```
 
-### 5.5 用户授权采集 Agent（小红书/抖音）
+### 5.5 用户授权采集 Agent（小红书链接/评论区截图）
 
 ```python
 # app/agents/social_parser_agent.py
@@ -1246,7 +1681,7 @@ class SocialNoteParser:
         )
     
     async def parse_text(self, text: str, comments: list[str] = None) -> ParsedSocialNote:
-        """解析文本内容"""
+        """解析文本内容（从小红书链接提取）"""
         # 简单 NLP 提取
         title = text.split('\n')[0][:50]
         content = text[:500]
@@ -1259,32 +1694,330 @@ class SocialNoteParser:
             "comments": "\n".join(comments or [])
         })
     
-    async def parse_screenshot(self, image_base64: str) -> ParsedSocialNote:
-        """解析截图（OCR + LLM）"""
+    async def parse_comment_screenshot(self, image_base64: str) -> ParsedSocialNote:
+        """
+        解析评论区截图（OCR + LLM）
+        用户场景：用户截取小红书笔记的评论区，包含多条真实评价
+        """
         # 1. Base64 转图片
         image_data = base64.b64decode(image_base64)
         image = Image.open(io.BytesIO(image_data))
         
-        # 2. OCR 识别（使用 PaddleOCR 或 Tesseract）
+        # 2. OCR 识别（使用 PaddleOCR）
         from paddleocr import PaddleOCR
         ocr = PaddleOCR(use_angle_cls=True, lang='ch')
         result = ocr.ocr(image)
         
-        # 提取文字
-        text = "\n".join([line[1][0] for line in result[0]])
+        # 提取文字（按行组织）
+        lines = []
+        for line in result[0]:
+            text = line[1][0]
+            confidence = line[1][1]
+            if confidence > 0.6:  # 过滤低置信度
+                lines.append(text)
         
-        # 3. 调用文本解析
-        return await self.parse_text(text)
+        # 3. 识别评论结构
+        # 评论区通常格式："用户名：评论内容" 或 "@用户名 回复：评论"
+        comments = []
+        main_content = []
+        for line in lines:
+            if ':' in line or ':' in line:
+                comments.append(line)
+            else:
+                main_content.append(line)
+        
+        # 4. 调用 LLM 解析
+        return await self.chain.invoke({
+            "title": "评论区截图",
+            "content": "\n".join(main_content),
+            "hashtags": "",
+            "comments": comments
+        })
     
     async def parse_url(self, url: str) -> ParsedSocialNote:
-        """解析链接（需要后端服务）"""
-        # 调用后端解析服务
-        response = await fetch(f"{BACKEND_URL}/parse-social-url", {
+        """
+        解析小红书链接
+        用户场景：用户分享小红书笔记链接，后端解析内容
+        """
+        # 方案 A：调用第三方解析服务（推荐）
+        # 使用类似"轻抖"、"解析狗"等第三方 API
+        response = await fetch(f"{PARSER_SERVICE_URL}/xiaohongshu", {
             "method": "POST",
+            "headers": {"Content-Type": "application/json"},
             "body": json.dumps({"url": url})
         })
+        
+        if response.status != 200:
+            raise Exception(f"解析失败：{response.status}")
+        
         data = await response.json()
-        return await self.parse_text(data["content"], data["comments"])
+        return await self.parse_text(
+            data.get("content", ""),
+            data.get("comments", [])
+        )
+    
+    async def parse(self, input_type: str, content: str) -> ParsedSocialNote:
+        """
+        统一解析接口
+        :param input_type: "url" | "screenshot"
+        :param content: 链接或 Base64 图片
+        """
+        if input_type == "url":
+            return await self.parse_url(content)
+        elif input_type == "screenshot":
+            return await self.parse_comment_screenshot(content)
+        else:
+            raise ValueError(f"不支持的输入类型：{input_type}")
+```
+
+#### 5.5.1 前端组件设计
+
+```typescript
+// src/components/SocialShareUpload.tsx
+"use client";
+
+import { useState, useCallback } from "react";
+import { motion } from "framer-motion";
+
+interface SocialShareUploadProps {
+  onComplete?: (data: ParsedSocialNote) => void;
+}
+
+export default function SocialShareUpload({ onComplete }: SocialShareUploadProps) {
+  const [uploadType, setUploadType] = useState<"url" | "screenshot">("url");
+  const [urlInput, setUrlInput] = useState("");
+  const [screenshotBase64, setScreenshotBase64] = useState<string | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  // 处理链接提交
+  const handleUrlSubmit = useCallback(async () => {
+    if (!urlInput.trim()) return;
+    
+    setLoading(true);
+    setError(null);
+    
+    try {
+      // 验证链接格式
+      if (!urlInput.includes("xiaohongshu.com") && !urlInput.includes("xhslink.com")) {
+        throw new Error("请输入有效的小红书链接");
+      }
+      
+      const response = await fetch("/api/parse-social", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          type: "url",
+          content: urlInput
+        })
+      });
+      
+      if (!response.ok) throw new Error("解析失败，请重试");
+      
+      const data = await response.json();
+      onComplete?.(data);
+      setUrlInput("");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "解析失败");
+    } finally {
+      setLoading(false);
+    }
+  }, [urlInput, onComplete]);
+
+  // 处理截图上传
+  const handleScreenshotUpload = useCallback(async (file: File) => {
+    setLoading(true);
+    setError(null);
+    
+    try {
+      // 转 Base64
+      const base64 = await fileToBase64(file);
+      setScreenshotBase64(base64);
+      
+      const response = await fetch("/api/parse-social", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          type: "screenshot",
+          content: base64
+        })
+      });
+      
+      if (!response.ok) throw new Error("解析失败，请重试");
+      
+      const data = await response.json();
+      onComplete?.(data);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "解析失败");
+    } finally {
+      setLoading(false);
+    }
+  }, [onComplete]);
+
+  return (
+    <div className="flex w-full max-w-lg flex-col gap-4 rounded-2xl bg-white/90 p-6 shadow-lg">
+      {/* 切换上传类型 */}
+      <div className="flex gap-2">
+        <button
+          onClick={() => setUploadType("url")}
+          className={`flex-1 rounded-xl py-3 text-sm font-semibold transition-colors ${
+            uploadType === "url"
+              ? "bg-gradient-to-r from-red-500 to-pink-500 text-white"
+              : "bg-gray-100 text-gray-600 hover:bg-gray-200"
+          }`}
+        >
+          📎 粘贴链接
+        </button>
+        <button
+          onClick={() => setUploadType("screenshot")}
+          className={`flex-1 rounded-xl py-3 text-sm font-semibold transition-colors ${
+            uploadType === "screenshot"
+              ? "bg-gradient-to-r from-red-500 to-pink-500 text-white"
+              : "bg-gray-100 text-gray-600 hover:bg-gray-200"
+          }`}
+        >
+          📸 上传截图
+        </button>
+      </div>
+
+      {/* 链接输入 */}
+      {uploadType === "url" && (
+        <div className="space-y-3">
+          <textarea
+            value={urlInput}
+            onChange={(e) => setUrlInput(e.target.value)}
+            placeholder="粘贴小红书笔记链接，如：https://www.xiaohongshu.com/explore/..."
+            className="h-24 w-full resize-none rounded-xl border border-gray-200 p-3 text-sm focus:border-pink-500 focus:outline-none"
+          />
+          <button
+            onClick={handleUrlSubmit}
+            disabled={loading || !urlInput.trim()}
+            className="w-full cursor-pointer rounded-xl bg-gradient-to-r from-red-500 to-pink-500 py-3 font-semibold text-white disabled:opacity-50"
+          >
+            {loading ? "解析中..." : "开始解析"}
+          </button>
+        </div>
+      )}
+
+      {/* 截图上传 */}
+      {uploadType === "screenshot" && (
+        <div className="space-y-3">
+          <label className="flex h-40 cursor-pointer flex-col items-center justify-center rounded-xl border-2 border-dashed border-gray-300 bg-gray-50 transition-colors hover:bg-gray-100">
+            {screenshotBase64 ? (
+              <img
+                src={screenshotBase64}
+                alt="预览"
+                className="h-full w-full object-contain rounded-lg"
+              />
+            ) : (
+              <>
+                <span className="text-4xl">📸</span>
+                <p className="mt-2 text-sm text-gray-500">
+                  点击上传评论区截图
+                </p>
+                <p className="text-xs text-gray-400">
+                  支持小红书/抖音笔记的评论区截图
+                </p>
+              </>
+            )}
+            <input
+              type="file"
+              accept="image/*"
+              onChange={(e) => {
+                const file = e.target.files?.[0];
+                if (file) handleScreenshotUpload(file);
+              }}
+              className="hidden"
+            />
+          </label>
+          {screenshotBase64 && (
+            <button
+              onClick={() => setScreenshotBase64(null)}
+              className="w-full cursor-pointer rounded-xl bg-gray-200 py-3 text-sm font-semibold text-gray-700"
+            >
+              重新上传
+            </button>
+          )}
+        </div>
+      )}
+
+      {/* 错误提示 */}
+      {error && (
+        <div className="rounded-xl bg-red-50 p-3 text-sm text-red-600">
+          ⚠️ {error}
+        </div>
+      )}
+
+      {/* 使用说明 */}
+      <div className="mt-2 rounded-xl bg-blue-50 p-4">
+        <p className="text-sm font-semibold text-blue-800">💡 使用提示</p>
+        <ul className="mt-2 list-inside list-disc text-xs text-blue-600 space-y-1">
+          <li>粘贴小红书笔记链接，AI 自动解析店铺信息和评价</li>
+          <li>上传评论区截图，AI 识别多条真实用户评价</li>
+          <li>解析结果将用于个性化推荐，让 AI 更懂你的口味</li>
+        </ul>
+      </div>
+    </div>
+  );
+}
+
+// 工具函数：File 转 Base64
+function fileToBase64(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result as string);
+    reader.onerror = reject;
+    reader.readAsDataURL(file);
+  });
+}
+```
+
+#### 5.5.2 API 路由实现
+
+```typescript
+// src/app/api/parse-social/route.ts
+import { NextRequest, NextResponse } from "next/server";
+import { SocialNoteParser } from "@/src/lib/social-parser";
+
+const parser = new SocialNoteParser();
+
+export async function POST(request: NextRequest) {
+  try {
+    const body = await request.json();
+    const { type, content } = body;
+
+    if (!type || !content) {
+      return NextResponse.json(
+        { success: false, error: "缺少必要参数" },
+        { status: 400 }
+      );
+    }
+
+    if (!["url", "screenshot"].includes(type)) {
+      return NextResponse.json(
+        { success: false, error: "不支持的解析类型" },
+        { status: 400 }
+      );
+    }
+
+    // 调用解析服务
+    const result = await parser.parse(type, content);
+
+    return NextResponse.json({
+      success: true,
+      data: result
+    });
+  } catch (error) {
+    console.error("解析失败:", error);
+    return NextResponse.json(
+      { 
+        success: false, 
+        error: error instanceof Error ? error.message : "解析失败"
+      },
+      { status: 500 }
+    );
+  }
+}
 ```
 
 ---
