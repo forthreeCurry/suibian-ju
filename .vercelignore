@@ -1,5 +1,5 @@
 # Python V2 推荐 API（独立部署，不在 Vercel 运行）
-api/
+/api/
 
 # 文档
 docs/
