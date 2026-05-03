@@ -5,6 +5,7 @@ import { useRouter } from "next/navigation";
 import { motion, AnimatePresence } from "framer-motion";
 import { supabase } from "@/src/lib/supabase";
 import { seedDemoMembersForRoom } from "@/src/lib/demoBots";
+import RestaurantList from "@/src/components/RestaurantList";
 
 const AVATARS = [
   "🐱", "🐶", "🐼", "🦊", "🐸", "🐯", "🐷", "🐵",
@@ -40,6 +41,7 @@ export default function Home() {
   // modal state
   const [showCreate, setShowCreate] = useState(false);
   const [showJoin, setShowJoin] = useState(false);
+  const [showExplore, setShowExplore] = useState(false);
   const [modalStep, setModalStep] = useState<ModalStep>("scene");
 
   // create form state
@@ -228,6 +230,28 @@ export default function Home() {
         <div className="rounded-2xl border border-white/15 bg-white/10 py-8 text-center backdrop-blur">
           <p className="text-sm text-white/40">还没有历史记录哦</p>
         </div>
+      </motion.div>
+
+      {/* explore nearby restaurants */}
+      <motion.div
+        custom={5}
+        variants={fadeInUp}
+        initial="hidden"
+        animate="visible"
+        className="mt-4 w-full max-w-sm"
+      >
+        <motion.button
+          whileTap={{ scale: 0.97 }}
+          onClick={() => setShowExplore(true)}
+          className="flex w-full cursor-pointer items-center gap-3 rounded-2xl border border-white/20 bg-white/15 px-4 py-4 text-left backdrop-blur transition-colors hover:bg-white/25"
+        >
+          <span className="text-2xl">🔍</span>
+          <div>
+            <h4 className="text-sm font-semibold text-white">浏览附近美食</h4>
+            <p className="text-xs text-white/60">看看周边有什么好吃的</p>
+          </div>
+          <span className="ml-auto text-white/40">→</span>
+        </motion.button>
       </motion.div>
 
       {/* footer */}
@@ -464,6 +488,28 @@ export default function Home() {
                 取消
               </button>
             </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* ====== EXPLORE MODAL ====== */}
+      <AnimatePresence>
+        {showExplore && (
+          <motion.div
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            className="fixed inset-0 z-40 flex flex-col items-center overflow-auto bg-white px-4 pt-12 pb-8"
+          >
+            {/* close */}
+            <button
+              onClick={() => setShowExplore(false)}
+              className="absolute top-4 right-4 z-10 flex h-10 w-10 cursor-pointer items-center justify-center rounded-full bg-gray-100 text-lg text-gray-500 transition-colors hover:bg-gray-200"
+            >
+              ✕
+            </button>
+
+            <RestaurantList />
           </motion.div>
         )}
       </AnimatePresence>

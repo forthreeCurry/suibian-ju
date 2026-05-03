@@ -64,16 +64,24 @@ function Recenter({ position }: { position: [number, number] }) {
 }
 
 interface ManualLocationMapProps {
+  initialLat?: number;
+  initialLon?: number;
   onConfirm: (lat: number, lon: number, address: string) => void;
   onBack: () => void;
 }
 
 export default function ManualLocationMap({
+  initialLat,
+  initialLon,
   onConfirm,
   onBack,
 }: ManualLocationMapProps) {
   const icon = useMemo(() => createIcon(), []);
-  const [position, setPosition] = useState<[number, number]>(DEFAULT_CENTER);
+  const initialPosition = useMemo<[number, number]>(() => {
+    if (initialLat != null && initialLon != null) return [initialLat, initialLon];
+    return DEFAULT_CENTER;
+  }, [initialLat, initialLon]);
+  const [position, setPosition] = useState<[number, number]>(initialPosition);
   const [address, setAddress] = useState<string>(MAP_HINT);
   const [loadingAddr, setLoadingAddr] = useState(false);
 

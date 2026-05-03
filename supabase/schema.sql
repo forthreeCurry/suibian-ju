@@ -132,3 +132,32 @@ alter publication supabase_realtime add table public.rooms;
 alter publication supabase_realtime add table public.members;
 alter publication supabase_realtime add table public.preferences;
 alter publication supabase_realtime add table public.results;
+
+-- ============================================================
+-- 8. V2.0 新增结构说明（增量迁移见 migration-v2-001-restaurants.sql）
+-- ============================================================
+-- 扩展：vector（pgvector），用于 restaurant_embeddings.embedding。
+--
+-- 表 public.restaurants：餐厅主表。主键 id (uuid)；唯一 gaode_id、meituan_id；
+-- 名称/地址/经纬度/菜系 categories(tags jsonb)/评分与均价/price_level(low|mid|high)/
+-- 电话营业时间封面图/images/source/is_active/时间戳等。
+--
+-- 表 public.restaurant_embeddings：每店一条向量。restaurant_id → restaurants ON DELETE CASCADE，
+-- embedding vector(384)，text_content 为生成向量的原文。
+--
+-- 表 public.user_location_history：user_id（可匿名）+ 经纬度 + 可选地址、精度、
+-- location_source(gps|network|wifi|ip)。
+--
+-- 表 public.social_notes：按 url/platform(xiaohongshu|douyin) 等缓存解析结果 parsed_data(jsonb)。
+--
+-- 索引：restaurants(gaode_id, meituan_id, cuisine, price_level)；
+-- restaurant_embeddings IVFFlat(embedding vector_cosine_ops, lists=100)；
+-- user_location_history(user_id, created_at desc)。
+--
+-- 函数 public.search_restaurants_v2(query_embedding, user_lat, user_lng,
+--   max_distance_km, match_budget, match_threshold, max_results)：
+-- 返回 id, name, address, cuisine, rating, avg_price, distance_km(Haversine), similarity(1 - cosine 距离)；
+-- 过滤相似度、距离、可选人均预算；排序 similarity desc, rating desc, distance_km asc。
+--
+-- RLS：上述四表均开启，MVP 策略为 select/insert/update/delete 全 true。
+-- Realtime：publication supabase_realtime 包含 restaurants、restaurant_embeddings。
