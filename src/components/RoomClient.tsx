@@ -8,6 +8,7 @@ import {
   generateRecommendations,
   type Recommendation,
 } from "@/src/lib/ai-recommend";
+import { apiClient, type V2Recommendation, type V2RecommendResult } from "@/src/lib/api-client";
 import {
   getWeather,
   formatWeatherLoadingLine,
@@ -206,10 +207,13 @@ export default function RoomClient({ id: shortCode }: { id: string }) {
   const [generateLoading, setGenerateLoading] = useState(false);
   const [aiWeatherLine, setAiWeatherLine] = useState<string | undefined>();
   const [resultRecs, setResultRecs] = useState<Recommendation[]>([]);
+  const [resultRecsV2, setResultRecsV2] = useState<V2Recommendation[]>([]);
+  const [resultV2Meta, setResultV2Meta] = useState<V2RecommendResult["metadata"] | null>(null);
   const [resultWeather, setResultWeather] = useState<WeatherSnapshot | null>(
     null,
   );
   const [resultLoaded, setResultLoaded] = useState(false);
+  const [useV2, setUseV2] = useState(false);
   const [initDone, setInitDone] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const channelRef = useRef<ReturnType<typeof supabase.channel> | null>(null);
@@ -415,8 +419,17 @@ export default function RoomClient({ id: shortCode }: { id: string }) {
   useEffect(() => {
     if (userStep !== "ai_results" || !room?.id) {
       setResultRecs([]);
+      setResultRecsV2([]);
+      setResultV2Meta(null);
       setResultWeather(null);
       setResultLoaded(false);
+      setUseV2(false);
+      return;
+    }
+
+    // V2 已内联处理，跳过拉取
+    if (useV2) {
+      setResultLoaded(true);
       return;
     }
 
@@ -440,7 +453,14 @@ export default function RoomClient({ id: shortCode }: { id: string }) {
           return;
         }
         if (Array.isArray(data.recommendations)) {
-          setResultRecs(data.recommendations as Recommendation[]);
+          // 检测 V2 格式（有 breakdown 字段）
+          const first = data.recommendations[0] as Record<string, unknown> | undefined;
+          if (first && typeof first === "object" && "breakdown" in first) {
+            setResultRecsV2(data.recommendations as V2Recommendation[]);
+            setUseV2(true);
+          } else {
+            setResultRecs(data.recommendations as Recommendation[]);
+          }
         } else {
           setResultRecs([]);
         }
@@ -455,7 +475,7 @@ export default function RoomClient({ id: shortCode }: { id: string }) {
     return () => {
       cancelled = true;
     };
-  }, [userStep, room?.id]);
+  }, [userStep, room?.id, useV2]);
 
   const resultWeatherHintText = useMemo(
     () => weatherResultHint(resultWeather),
@@ -691,9 +711,98 @@ export default function RoomClient({ id: shortCode }: { id: string }) {
       .update({ status: "calculating" })
       .eq("id", room.id);
 
+    if (err) {
+      console.error("Failed to start AI:", err);
+      setGenerateLoading(false);
+      return;
+    }
+
     setGenerateLoading(false);
-    if (err) console.error("Failed to start AI:", err);
-  }, [room, isHost, memberId, generateLoading]);
+
+    // V2: 尝试调用 Python 后端推荐 API
+    const useV2Api = process.env.NEXT_PUBLIC_USE_V2_API === "true";
+    if (useV2Api) {
+      try {
+        // 收集所有成员偏好
+        const memberIds = members.map((m) => m.id);
+        const { data: prefsData } = await supabase
+          .from("preferences")
+          .select("*")
+          .in("member_id", memberIds);
+
+        // 聚合偏好
+        const allLikes: string[] = [];
+        const allDislikes: string[] = [];
+        const allRestrictions: string[] = [];
+        let maxBudget = 500;
+        let firstLocation: { lat: number; lng: number } | null = null;
+
+        for (const p of (prefsData ?? [])) {
+          const tastes = p.taste_likes as { likes?: string[]; dislikes?: string[] } | null;
+          if (tastes?.likes) allLikes.push(...tastes.likes);
+          if (tastes?.dislikes) allDislikes.push(...tastes.dislikes);
+          if (p.dietary_restrictions) allRestrictions.push(...(p.dietary_restrictions as string[]));
+          if (p.budget && Number(p.budget) > maxBudget) maxBudget = Number(p.budget);
+          if (!firstLocation && p.departure_location) {
+            const dl = p.departure_location as Record<string, unknown>;
+            const dlat = typeof dl.lat === "number" ? dl.lat : undefined;
+            const dlng = typeof dl.lng === "number" ? dl.lng : typeof dl.lon === "number" ? dl.lon : undefined;
+            if (dlat !== undefined && dlng !== undefined) {
+              firstLocation = { lat: dlat, lng: dlng };
+            }
+          }
+        }
+
+        const centerLoc = firstLocation ?? { lat: 39.9, lng: 116.4 }; // fallback
+
+        const v2Res = await apiClient.recommendV2({
+          room_id: room.id,
+          preferences: {
+            likes: [...new Set(allLikes)],
+            dislikes: [...new Set(allDislikes)],
+            dietary_restrictions: [...new Set(allRestrictions)],
+            budget: String(maxBudget),
+            transport_mode: "walk",
+          },
+          location: centerLoc,
+          weather: weatherInfo,
+        });
+
+        if (v2Res.success) {
+          const { recommendations: v2recs, metadata: v2meta } = v2Res.data;
+
+          // V2 返回空结果 → 降级到 V1
+          if (!v2recs || v2recs.length === 0) {
+            console.warn("V2 returned 0 recommendations, falling back to V1");
+          } else {
+            // 写入 results 表
+            await supabase.from("results").insert({
+              room_id: room.id,
+              recommendations: v2recs,
+              weather_info: weatherInfo,
+              created_at: new Date().toISOString(),
+            });
+
+            // 设置状态为 finished
+            await supabase.from("rooms").update({ status: "finished" }).eq("id", room.id);
+
+            setResultRecsV2(v2recs);
+            setResultV2Meta(v2meta);
+            setUseV2(true);
+            setUserStep("ai_results");
+            return;
+          }
+          // V2 返回空结果，降级到 V1
+          console.warn("V2 returned 0 recommendations, falling back to V1");
+        } else {
+          console.warn("V2 API failed, falling back to V1:", v2Res.error);
+        }
+      } catch (e) {
+        console.error("V2 API error, falling back to V1:", e);
+      }
+    }
+    // V2 未启用或失败，V1 降级在 AILoading onComplete 中处理
+  }, [room, isHost, memberId, generateLoading, members]);
 
   // ---- renders ----
 
@@ -1027,18 +1136,22 @@ export default function RoomClient({ id: shortCode }: { id: string }) {
                 budgetRange={aiBudgetRange}
                 geoArea={aiGeoArea}
                 weatherLine={aiWeatherLine}
-                onComplete={() => {
+                onComplete={async () => {
                   if (!room?.id) return;
-                  if (isHost) {
-                    void (async () => {
-                      try {
-                        await generateRecommendations(room.id);
-                      } catch (e) {
-                        console.error("generateRecommendations failed:", e);
-                      }
-                      setUserStep("ai_results");
-                    })();
+                  // V2 已处理完成 → 直接展示
+                  if (useV2) {
+                    setUserStep("ai_results");
+                    return;
                   }
+                  // V1 降级
+                  if (isHost) {
+                    try {
+                      await generateRecommendations(room.id);
+                    } catch (e) {
+                      console.error("generateRecommendations failed:", e);
+                    }
+                  }
+                  setUserStep("ai_results");
                 }}
               />
             </motion.div>
@@ -1076,13 +1189,101 @@ export default function RoomClient({ id: shortCode }: { id: string }) {
                   <p className="text-sm font-medium">正在加载推荐结果…</p>
                 </div>
               )}
-              {resultLoaded && resultRecs.length === 0 && (
+              {resultLoaded && resultRecs.length === 0 && resultRecsV2.length === 0 && (
                 <p className="rounded-2xl border border-white/25 bg-black/15 px-4 py-6 text-center text-sm text-white/85">
                   暂时没有推荐数据，请让发起人重新生成，或稍后再试。
                 </p>
               )}
               <ul className="flex flex-col gap-3">
-                {resultLoaded &&
+                {resultLoaded && useV2 && resultRecsV2.length > 0 &&
+                  resultRecsV2.map((r, i) => (
+                  <li
+                    key={`${r.name}-${i}`}
+                    className="relative overflow-hidden rounded-2xl border border-white/25 bg-white/95 px-4 py-3 shadow-lg backdrop-blur"
+                  >
+                    {i === 0 && (
+                      <span className="absolute right-3 top-3 rounded-full bg-gradient-to-r from-amber-400 to-orange-500 px-2 py-0.5 text-[10px] font-black text-white shadow">
+                        👑 最佳匹配
+                      </span>
+                    )}
+                    <div className={`${i === 0 ? "pr-16" : ""}`}>
+                      <p className="text-xs font-bold text-orange-600">
+                        第 {i + 1} 名 · 综合评分 {r.score.toFixed(0)} 分
+                      </p>
+                      <p className="truncate text-base font-bold text-zinc-900">
+                        {r.name}
+                      </p>
+
+                      {/* 五维分数条 */}
+                      <div className="mt-2 grid grid-cols-5 gap-1">
+                        {[
+                          ["口味", r.breakdown.taste_match, 40],
+                          ["预算", r.breakdown.budget_fit, 20],
+                          ["距离", r.breakdown.distance, 20],
+                          ["天气", r.breakdown.weather_adapt, 10],
+                          ["评分", r.breakdown.overall_rating, 10],
+                        ].map(([label, val, maxVal]) => {
+                          const pct = Math.round((Number(val) / Number(maxVal)) * 100);
+                          const barColor =
+                            pct >= 80 ? "bg-emerald-400" :
+                            pct >= 50 ? "bg-amber-400" : "bg-zinc-300";
+                          return (
+                            <div key={String(label)} className="flex flex-col items-center gap-0.5">
+                              <span className="text-[10px] text-zinc-500">{label}</span>
+                              <div className="h-1 w-full rounded-full bg-zinc-100">
+                                <div className={`h-full rounded-full ${barColor}`} style={{ width: `${Math.min(100, pct)}%` }} />
+                              </div>
+                              <span className="text-[10px] font-semibold text-zinc-600">{Number(val).toFixed(0)}</span>
+                            </div>
+                          );
+                        })}
+                      </div>
+
+                      {/* 推荐理由 */}
+                      {r.main_reason && (
+                        <p className="mt-2 text-xs leading-relaxed text-zinc-600">
+                          💬 {r.main_reason}
+                        </p>
+                      )}
+
+                      {/* 个性化标签 */}
+                      {r.personalized_tags && r.personalized_tags.length > 0 && (
+                        <div className="mt-2 flex flex-wrap gap-1">
+                          {r.personalized_tags.map((t) => (
+                            <span key={t} className="rounded-md bg-violet-50 px-1.5 py-0.5 text-[11px] font-medium text-violet-600">
+                              {t}
+                            </span>
+                          ))}
+                        </div>
+                      )}
+
+                      {/* 社交媒体引用 */}
+                      {r.citations && r.citations.length > 0 && (
+                        <div className="mt-2 rounded-lg bg-rose-50 px-2 py-1">
+                          <p className="text-[10px] text-rose-500">
+                            📖 &ldquo;{r.citations[0].excerpt}&rdquo;
+                            {r.citations[0].source && ` —来自${r.citations[0].source}`}
+                          </p>
+                        </div>
+                      )}
+
+                      {/* 避雷提醒 */}
+                      {r.warning && (
+                        <div className="mt-2 rounded-lg bg-amber-50 px-2 py-1">
+                          <p className="text-[10px] font-medium text-amber-600">⚠️ {r.warning}</p>
+                        </div>
+                      )}
+                    </div>
+
+                    <div className="mt-3 flex justify-center gap-6 border-t border-zinc-200/80 pt-2">
+                      <button type="button" disabled className="text-lg opacity-40 grayscale" title="投票即将上线">👍</button>
+                      <button type="button" disabled className="text-lg opacity-40 grayscale" title="投票即将上线">👎</button>
+                    </div>
+                  </li>
+                ))}
+
+                {/* V1 fallback display */}
+                {resultLoaded && !useV2 && resultRecs.length > 0 &&
                   resultRecs.map((r, i) => (
                   <li
                     key={`${r.name}-${i}`}
@@ -1094,52 +1295,22 @@ export default function RoomClient({ id: shortCode }: { id: string }) {
                       </span>
                     )}
                     <div className="flex items-start gap-3">
-                      <span className="text-3xl">
-                        {cuisineEmoji(r.cuisine)}
-                      </span>
-                      <div
-                        className={`min-w-0 flex-1 ${i === 0 ? "pr-16" : ""}`}
-                      >
-                        <p className="text-xs font-bold text-orange-600">
-                          第 {i + 1} 名 · {r.cuisine}
-                        </p>
-                        <p className="truncate text-base font-bold text-zinc-900">
-                          {r.name}
-                        </p>
+                      <span className="text-3xl">{cuisineEmoji(r.cuisine)}</span>
+                      <div className={`min-w-0 flex-1 ${i === 0 ? "pr-16" : ""}`}>
+                        <p className="text-xs font-bold text-orange-600">第 {i + 1} 名 · {r.cuisine}</p>
+                        <p className="truncate text-base font-bold text-zinc-900">{r.name}</p>
                         <p className="mt-1 text-xs font-semibold text-zinc-700">
-                          人均 ¥{r.avgPrice} · 口碑 {r.rating.toFixed(1)} 星 ·
-                          匹配度{" "}
-                          <span className="text-orange-600">
-                            {r.matchScore}%
-                          </span>
+                          人均 ¥{r.avgPrice} · 口碑 {r.rating.toFixed(1)} 星 · 匹配度 <span className="text-orange-600">{r.matchScore}%</span>
                         </p>
                         {r.tags.length > 0 && (
-                          <p className="mt-1 text-[11px] text-zinc-500">
-                            {r.tags.slice(0, 4).join(" · ")}
-                          </p>
+                          <p className="mt-1 text-[11px] text-zinc-500">{r.tags.slice(0, 4).join(" · ")}</p>
                         )}
-                        <p className="mt-2 text-xs leading-relaxed text-zinc-600">
-                          {r.reason}
-                        </p>
+                        <p className="mt-2 text-xs leading-relaxed text-zinc-600">{r.reason}</p>
                       </div>
                     </div>
                     <div className="mt-3 flex justify-center gap-6 border-t border-zinc-200/80 pt-2">
-                      <button
-                        type="button"
-                        disabled
-                        className="text-lg opacity-40 grayscale"
-                        title="投票即将上线"
-                      >
-                        👍
-                      </button>
-                      <button
-                        type="button"
-                        disabled
-                        className="text-lg opacity-40 grayscale"
-                        title="投票即将上线"
-                      >
-                        👎
-                      </button>
+                      <button type="button" disabled className="text-lg opacity-40 grayscale" title="投票即将上线">👍</button>
+                      <button type="button" disabled className="text-lg opacity-40 grayscale" title="投票即将上线">👎</button>
                     </div>
                   </li>
                 ))}
