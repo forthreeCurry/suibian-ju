@@ -1,99 +1,46 @@
-import { NextRequest, NextResponse } from "next/server";
-import { LOCATION_ADDRESS_FALLBACK } from "@/src/lib/locationLabels";
+/** 高德逆地理编码代理 */
+export async function GET(request: Request) {
+  const { searchParams } = new URL(request.url);
+  const lat = searchParams.get("lat");
+  const lon = searchParams.get("lon");
 
-const UA =
-  "SuibianJu/1.0 (+https://github.com/suibian-ju; contact: app reverse geocode)";
-
-type NominatimAddr = Record<string, string | undefined>;
-
-function buildReadableAddress(
-  displayName: string | undefined,
-  addr: NominatimAddr | undefined,
-): string {
-  const trimmed = displayName?.split(",").map((s) => s.trim()).filter(Boolean) ?? [];
-  if (trimmed.length > 0) {
-    return trimmed.slice(0, 5).join(" · ");
-  }
-
-  if (addr && typeof addr === "object") {
-    const parts = [
-      addr.amenity,
-      addr.building,
-      addr.road,
-      addr.neighbourhood,
-      addr.suburb,
-      addr.quarter,
-      addr.city_district,
-      addr.district,
-      addr.city,
-      addr.town,
-      addr.village,
-      addr.county,
-      addr.state,
-      addr.region,
-      addr.country,
-    ].filter((x): x is string => typeof x === "string" && x.length > 0);
-
-    const seen = new Set<string>();
-    const unique: string[] = [];
-    for (const p of parts) {
-      if (!seen.has(p)) {
-        seen.add(p);
-        unique.push(p);
-      }
-      if (unique.length >= 5) break;
-    }
-    if (unique.length > 0) return unique.join(" · ");
-  }
-
-  return LOCATION_ADDRESS_FALLBACK;
-}
-
-export async function GET(req: NextRequest) {
-  const lat = req.nextUrl.searchParams.get("lat");
-  const lon = req.nextUrl.searchParams.get("lon");
   if (!lat || !lon) {
-    return NextResponse.json({ error: "missing lat or lon" }, { status: 400 });
+    return Response.json({ error: "缺少 lat/lon 参数" }, { status: 400 });
   }
 
-  const latN = Number(lat);
-  const lonN = Number(lon);
-  if (!Number.isFinite(latN) || !Number.isFinite(lonN)) {
-    return NextResponse.json({ error: "invalid coordinates" }, { status: 400 });
+  const key = process.env.GAODE_API_KEY;
+  if (!key) {
+    return Response.json({ address: `${Number(lat).toFixed(4)}, ${Number(lon).toFixed(4)}` });
   }
 
-  const url = new URL("https://nominatim.openstreetmap.org/reverse");
-  url.searchParams.set("lat", String(latN));
-  url.searchParams.set("lon", String(lonN));
-  url.searchParams.set("format", "json");
-  url.searchParams.set("addressdetails", "1");
-  url.searchParams.set("accept-language", "zh");
-
-  const controller = new AbortController();
-  const t = setTimeout(() => controller.abort(), 8000);
+  const url = `https://restapi.amap.com/v3/geocode/regeo?key=${key}&location=${lon},${lat}`;
 
   try {
-    const res = await fetch(url.toString(), {
-      headers: { "User-Agent": UA },
-      signal: controller.signal,
-      cache: "no-store",
-    });
-    clearTimeout(t);
+    const res = await fetch(url);
+    const text = await res.text();
 
-    if (!res.ok) {
-      return NextResponse.json({ address: LOCATION_ADDRESS_FALLBACK }, { status: 200 });
+    const debug = searchParams.get("debug");
+    if (debug === "1") {
+      return Response.json({ raw: text.substring(0, 1000), url: url.substring(0, 150) });
     }
 
-    const data = (await res.json()) as {
-      display_name?: string;
-      address?: NominatimAddr;
-    };
+    const data = JSON.parse(text);
 
-    const address = buildReadableAddress(data.display_name, data.address);
+    const formatted = data?.regeocode?.formatted_address;
+    if (formatted && typeof formatted === "string" && formatted.length > 0) {
+      // "地图上所选位置" 是 Gaode 的通用占位，尝试用组件拼
+      if (formatted.includes("地图上所选位置")) {
+        const c = data.regeocode?.addressComponent || {};
+        const parts = [c.province, c.city, c.district, c.township, c.streetNumber?.street].filter(Boolean);
+        if (parts.length > 0) {
+          return Response.json({ address: parts.join("") });
+        }
+      }
+      return Response.json({ address: formatted });
+    }
 
-    return NextResponse.json({ address });
+    return Response.json({ address: `${Number(lat).toFixed(4)}, ${Number(lon).toFixed(4)}` });
   } catch {
-    clearTimeout(t);
-    return NextResponse.json({ address: LOCATION_ADDRESS_FALLBACK });
+    return Response.json({ address: `${Number(lat).toFixed(4)}, ${Number(lon).toFixed(4)}` });
   }
 }
