@@ -1,0 +1,42 @@
+# Frontend
+app/
+src/
+public/
+node_modules/
+.next/
+package.json
+package-lock.json
+next.config.ts
+tsconfig.json
+tailwind.config.ts
+postcss.config.mjs
+eslint.config.mjs
+
+# Git
+.git/
+.gitignore
+
+# Docs
+docs/
+
+# Old subproject
+suibian-ju/
+
+# Vercel
+.vercel/
+.vercelignore
+
+# Supabase migrations
+supabase/
+
+# Python venv
+api/.venv/
+api/venv/
+
+# Env files (secrets set via HF Spaces settings)
+api/.env
+.env
+.env.local
+
+# Original requirements
+api/requirements.txt
