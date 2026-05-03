@@ -17,6 +17,9 @@ RUN pip install --no-cache-dir -r requirements-hf.txt
 # 复制应用代码
 COPY api/ ./api/
 
+# Python 能找到 api/ 下的 app 模块
+ENV PYTHONPATH=/app/api
+
 # Hugging Face Spaces 固定端口
 EXPOSE 7860
 
